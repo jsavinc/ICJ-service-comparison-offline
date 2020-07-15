@@ -1,0 +1,68 @@
+---
+title: "Matched groups"
+author: "Jan Savinc"
+date: "15/07/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(knitr)
+```
+
+# Load data
+
+Note: these are the eDRIS-provided provisional matches, not the final matches used in the analysis!
+
+```{r}
+group2 <- read_excel(path = "../group2_controls.xlsx", trim_ws = TRUE) %>% mutate(group = "pre-ICJ, Glasgow")
+group3 <- read_excel(path = "../group3_controls.xlsx", trim_ws = TRUE) %>% mutate(group = "same period, RoS")
+```
+
+# Overlap of individuals between groups
+
+```{r}
+table_individuals_counts <-
+  tribble(
+    ~group, ~N,
+    "ICJ individuals, total", n_distinct(c(group2$id,group3$id)),
+    "ICJ individuals with 2 controls", n_distinct(intersect(group2$id,group3$id)),
+    "ICJ individuals with only pre-ICJ Glasgow controls", n_distinct(base::setdiff(group2$id, group3$id)),
+    "ICJ individuals with only RoS controls", n_distinct(base::setdiff(group3$id, group2$id)),
+    "Pre-ICJ Glasgow controls", n_distinct(group2$id_c),
+    "RoS controls", n_distinct(group3$id_c)
+  ) %>% mutate(
+    Percent = if_else(condition = str_starts(group,"ICJ"), true = scales::percent(N/n_distinct(c(group2$id,group3$id))), false = "")
+  )
+
+table_individuals_counts %>% kable(caption = "Number of individuals in cases & controls")
+```
+
+# Time period
+
+```{r}
+table_time_periods <- 
+  bind_rows(
+    bind_rows(group2,group3) %>% select(id, AssessmentStartDate, INCIDENCE_DATE) %>% mutate(group = "ICJ") %>% distinct,
+    group2 %>% select(INCIDENCE_DATE=INCIDENCE_DATE_c, group),
+    group3 %>% select(INCIDENCE_DATE=INCIDENCE_DATE_c, group)
+  ) %>%
+    group_by(group) %>%
+    summarise(
+      "ICJ use" = paste0(year(min(AssessmentStartDate)),"-",year(max(AssessmentStartDate))),
+      "Cancer incidence" = paste0(year(min(INCIDENCE_DATE)),"-",year(max(INCIDENCE_DATE)))
+    )
+
+table_time_periods %>% kable(caption = "Time periods of data for cases & controls")
+```
+
