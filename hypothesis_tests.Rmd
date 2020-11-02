@@ -1,0 +1,83 @@
+---
+title: "ICJ service moparison hypothesis tests"
+author: "Jan Savinc"
+date: "02/11/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(knitr)
+```
+
+# Load data
+
+```{r}
+# excel_sheets(path = "../analysis_exported_from_safe_haven/Baseline_and_usage_descriptives.xlsx")
+
+excel_tables <-
+  map(
+    .x = excel_sheets(path = "../analysis_exported_from_safe_haven/Baseline_and_usage_descriptives.xlsx"),
+    .f = ~read_excel(path = "../analysis_exported_from_safe_haven/Baseline_and_usage_descriptives.xlsx", sheet = .x)
+  ) %>% 
+  set_names(x=., nm=excel_sheets(path = "../analysis_exported_from_safe_haven/Baseline_and_usage_descriptives.xlsx")
+  )
+```
+
+## Checking that we're using the correct denominators
+
+```{r}
+excel_tables$NHS24 %>% filter(users == "entire group") %>% mutate(derived_N = as.integer(total_NHS24_calls / mean_NHS24_calls)) %>% select(Group, derived_N) %>% distinct %>% kable(caption = "Denominators (N) of each group")
+```
+
+## Defining denominators
+
+```{r}
+denominators <- tribble(
+  ~Group, ~N,
+  "ICJ", 1214,
+  "G2", 1034,
+  "G3", 1108
+)
+```
+
+
+# Proportions of users
+
+## NHS24
+
+```{r}
+excel_tables$NHS24 %>% filter(users == "entire group") %>%
+  mutate(proportion_users = parse_number(proportion_users) / 100)
+
+
+```
+
+# Time period
+
+```{r}
+table_time_periods <- 
+  bind_rows(
+    bind_rows(group2,group3) %>% select(id, AssessmentStartDate, INCIDENCE_DATE) %>% mutate(group = "ICJ") %>% distinct,
+    group2 %>% select(INCIDENCE_DATE=INCIDENCE_DATE_c, group),
+    group3 %>% select(INCIDENCE_DATE=INCIDENCE_DATE_c, group)
+  ) %>%
+    group_by(group) %>%
+    summarise(
+      "ICJ use" = paste0(year(min(AssessmentStartDate)),"-",year(max(AssessmentStartDate))),
+      "Cancer incidence" = paste0(year(min(INCIDENCE_DATE)),"-",year(max(INCIDENCE_DATE)))
+    )
+
+table_time_periods %>% kable(caption = "Time periods of data for cases & controls")
+```
+
