@@ -1,5 +1,5 @@
 ---
-title: "ICJ service moparison hypothesis tests"
+title: "ICJ service comparison hypothesis tests"
 author: "Jan Savinc"
 date: "02/11/2020"
 output: html_document
@@ -18,6 +18,27 @@ library(tidyverse)
 library(readxl)
 library(lubridate)
 library(knitr)
+library(broom)  # for tidy hypothesis testing
+library(rvest)  # for scraping tables from the .html file
+library(openxlsx)  # for saving excel files
+```
+
+
+## Helper functions
+
+```{r}
+print_mean_sd_inline <- function(mean, sd, digits=1) {
+  return(glue::glue("{format(round(mean,digits=digits),nsmall=digits,trim=TRUE)} ({format(round(sd,digits=digits),nsmall=digits,trim=TRUE)})"))
+}
+
+rename_groups_to_nice_names <- function(some_string) {
+  some_string %>%
+  str_replace(string = ., pattern = "g2|G2", replacement = "Glasgow") %>%
+  str_replace(string = ., pattern = "g3|G3", replacement = "ROS")
+}
+
+dir_results <- "./results"
+if (!dir.exists(dir_results)) dir.create(dir_results)
 ```
 
 # Load data
@@ -32,6 +53,29 @@ excel_tables <-
   ) %>% 
   set_names(x=., nm=excel_sheets(path = "../analysis_exported_from_safe_haven/Baseline_and_usage_descriptives.xlsx")
   )
+
+html_report <- 
+  read_html(x = "../analysis_exported_from_safe_haven/11_icj_pre_post_service_use.html")
+
+
+## Initialise tables
+tests <- list()
+processed <- list()
+
+## Nice names for the measures
+
+nice_names_for_measures <- tribble(
+  ~Measure, ~nice_name,
+  "AandE_mean_episodes", "A&E attendances",
+  "AandE_mean_hours", "Hours in A&E",
+  "NHS24_mean_calls", "NHS24 calls",
+  "SMR01_mean_episodes", "Hospital spells",
+  "SMR01_mean_days",  "Days in hospital",
+  "CUPS_mean_pathways", "care pathways",
+  "CUPS_mean_steps", "care pathway steps",
+  "PIS_psychotropics_mean_prescriptions", "Prescriptions for psychotropic drugs",
+  "PIS_psychotropics_mean_cost", "Cost of prescriptions for psychotropic drugs"
+)
 ```
 
 ## Checking that we're using the correct denominators
@@ -40,7 +84,9 @@ excel_tables <-
 excel_tables$NHS24 %>% filter(users == "entire group") %>% mutate(derived_N = as.integer(total_NHS24_calls / mean_NHS24_calls)) %>% select(Group, derived_N) %>% distinct %>% kable(caption = "Denominators (N) of each group")
 ```
 
+
 ## Defining denominators
+
 
 ```{r}
 denominators <- tribble(
@@ -51,33 +97,607 @@ denominators <- tribble(
 )
 ```
 
+# Cancer stage data
 
-# Proportions of users
+```{r}
+tables_from_html_report <-
+  html_report %>%
+  html_table
+
+table_cancer_stages_counts <-
+  tables_from_html_report[[2]] %>%
+  as_tibble()
+
+table_cancer_stages_summary <-
+  tables_from_html_report[[3]] %>%
+  as_tibble() %>% 
+  mutate(
+    N_total = N,  # compute non-missing N
+    N = N_total - (round(parse_number(prop_missing)/100 * N_total))
+    )
+data_for_cancer_stage_plot <-
+  table_cancer_stages_counts %>%
+  pivot_longer(cols=c(G2,G3,ICJ), names_to="Group", values_to="stage") %>%
+  left_join(table_cancer_stages_summary %>% select(cancer_type_grouped, Group, N_total)) %>%
+  mutate(
+    proportion_10 = 10/N_total,  # compute proportion of N=10 for suppressed data
+    proportion = parse_number(stage, na = c("","NA","<=10")) / 100,
+    was_suppressed = is.na(proportion),  # flag where the small N
+    proportion = if_else(was_suppressed, proportion_10, proportion),  # infer small proportion where data missing
+    Group = rename_groups_to_nice_names(Group) %>% factor(., levels=c("ICJ","Glasgow","ROS"))
+    )
+
+missing_data_cancer_stages_summary <-
+  table_cancer_stages_summary %>%
+  mutate(Group = rename_groups_to_nice_names(Group) %>% factor(., levels=c("ICJ","Glasgow","ROS")))
+
+plot_cancer_stage_data_reconstructed <-
+  ggplot(data = data_for_cancer_stage_plot, aes(x = stage_numeric_worst, y = proportion, fill = was_suppressed)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(Group~cancer_type_grouped, switch = "x") +
+  theme_minimal() +
+  scale_fill_grey() +
+  geom_text(data=missing_data_cancer_stages_summary, inherit.aes = FALSE, aes(x=3,y=0.43,label=paste0("Missing: ",prop_missing)), size=3.5) +
+  labs(y = "Proportion", x= "Cancer stage") +
+  NULL
+
+tests_cancer_stages <-
+  table_cancer_stages_summary %>%
+  mutate(
+    N_total = N,  # compute non-missing N
+    N = N_total - (round(parse_number(prop_missing)/100 * N_total))
+    ) %>%
+  (function(tbl) {
+    bind_rows(
+      ## ICJ-G2 difference
+      tbl %>% filter(Group %in% c("G2","ICJ")) %>%
+        select(cancer_type_grouped, Group, Mean_stage, SD_stage, N) %>%
+        pivot_wider(names_from = Group, values_from=c(Mean_stage, SD_stage, N)) %>%
+        group_by(cancer_type_grouped) %>%
+        summarise(
+        tidy(BSDA::tsum.test(
+          mean.x = Mean_stage_ICJ,
+          s.x = SD_stage_ICJ,
+          n.x = N_ICJ,
+          mean.y = Mean_stage_G2,
+          s.y = SD_stage_G2,
+          n.y = N_G2,
+          var.equal = FALSE
+          ## BSDA::tsum.test() performs a t-test from summary statistics, however, unlike other htest() methods it has a "parameters" value rather than "parameter", so this needs to be renamed
+        ) %>% (function(ret.val) {ret.val$parameter <- ret.val$parameters; return(ret.val)})),
+        .groups = "drop"
+      ) %>%
+       mutate(
+        difference = estimate1 - estimate2,
+        meaning = "ICJ-G2 cancer stage mean difference"
+        ) %>%
+      relocate(difference, .before=statistic)
+      ,
+      ## ICJ-G3 differences
+      tbl %>% filter(Group %in% c("G3","ICJ")) %>%
+        select(cancer_type_grouped, Group, Mean_stage, SD_stage, N) %>%
+        pivot_wider(names_from = Group, values_from=c(Mean_stage, SD_stage, N)) %>%
+        group_by(cancer_type_grouped) %>%
+        summarise(
+        tidy(BSDA::tsum.test(
+          mean.x = Mean_stage_ICJ,
+          s.x = SD_stage_ICJ,
+          n.x = N_ICJ,
+          mean.y = Mean_stage_G3,
+          s.y = SD_stage_G3,
+          n.y = N_G3,
+          var.equal = FALSE
+          ## BSDA::tsum.test() performs a t-test from summary statistics, however, unlike other htest() methods it has a "parameters" value rather than "parameter", so this needs to be renamed
+        ) %>% (function(ret.val) {ret.val$parameter <- ret.val$parameters; return(ret.val)})),
+        .groups = "drop"
+      ) %>%
+       mutate(
+        difference = estimate1 - estimate2,
+        meaning = "ICJ-G3 cancer stage mean difference"
+        ) %>%
+      relocate(difference, .before=statistic)
+      
+    )
+  }) %>%
+  relocate(meaning, .after=cancer_type_grouped) %>%
+  mutate(Group = str_extract(string = meaning, pattern="G\\d"))
+
+table_cancer_stages_combined <-
+  table_cancer_stages_summary %>%
+  group_by(Group) %>%
+  summarise(
+    mean = weighted.mean(x = Mean_stage, w = N),
+    N = sum(N),
+    sd = sqrt(sum(SD_stage^2)),
+    .groups = "drop"
+    )
+
+tests_cancer_stages_combined <-
+  table_cancer_stages_combined %>%
+  (function(tbl) {
+    list(
+      tbl %>% filter(Group %in% c("G2","ICJ")) %>%
+        pivot_wider(names_from=Group, values_from=c(mean,sd,N)) %>% mutate(comparison="ICJ-G2 stages combined"),
+      tbl %>% filter(Group %in% c("G3","ICJ")) %>%
+        pivot_wider(names_from=Group, values_from=c(mean,sd,N)) %>% mutate(comparison="ICJ-G3 stages combined")
+      ) %>%
+      map_dfr(.x=., .f=~rename_all(.x, ~str_replace(string=., pattern="\\d", replacement="")))
+  }) %>%
+  group_by(comparison) %>%
+  summarise(
+      tidy(BSDA::tsum.test(
+        mean.x = mean_ICJ,
+        s.x = sd_ICJ,
+        n.x = N_ICJ,
+        mean.y = mean_G,
+        s.y = sd_G,
+        n.y = N_G,
+        var.equal = FALSE
+        ## BSDA::tsum.test() performs a t-test from summary statistics, however, unlike other htest() methods it has a "parameters" value rather than "parameter", so this needs to be renamed
+      ) %>% (function(ret.val) {ret.val$parameter <- ret.val$parameters; return(ret.val)})),
+      .groups = "drop"
+    ) %>%
+     mutate(
+      difference = estimate1 - estimate2,
+      ) %>%
+    relocate(difference, .before=statistic)
+  
+
+table_cancer_stages_decriptives <-
+  table_cancer_stages_summary %>%
+  left_join(tests_cancer_stages %>% select(Group, cancer_type_grouped, p.value)) %>%
+  mutate(
+    mean_sd = print_mean_sd_inline(Mean_stage, SD_stage,digits=2),
+    mean_sd = if_else(!is.na(p.value) & p.value < 0.025, paste0(mean_sd,"*"), as.character(mean_sd))  # add asterisk to significantly different means in G2 or G3 from ICJ at .025 (for two tests)
+    ) %>%
+  select(cancer_type_grouped, Group, prop_missing, mean_sd) %>%
+  pivot_wider(names_from = Group, values_from = c(mean_sd, prop_missing)) %>%
+  rename_all(~rename_groups_to_nice_names(.))
+```
+
+
+# Tables of estimates for plotting & reporting hypothesis tests
+
+For hypothesis testing, we'll use estimates of the entire  group, i.e. including service non-users - this reduces the overall mean service usage but shows us the larger picture of how much the entire group used.
+
+
+```{r}
+processed$AandE_mean_episodes <-
+#   excel_tables$AandE %>%
+#   filter(users=="users only") %>%
+#   left_join(
+#     excel_tables$AandE %>%
+#       filter(users=="entire group") %>%
+#       left_join(denominators) %>%
+#       mutate(N_users = as.integer(parse_number(proportion_users)/100 * N)) %>%
+#       select(period,Group,N_users)
+#   ) %>%
+#   mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+#   select(period, Group, mean_episodes, sd_episodes, N_users) %>%
+#   pivot_wider(names_from = c(period), values_from=c(mean_episodes,sd_episodes,N_users)) 
+  excel_tables$AandE %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_episodes, sd_episodes, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_episodes,sd_episodes,N))
+
+processed$AandE_mean_hours <-
+  excel_tables$AandE %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_hours, sd_hours, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_hours,sd_hours,N))
+
+processed$NHS24_mean_calls <-
+  excel_tables$NHS24 %>%
+  filter(users=="users only") %>%
+  left_join(denominators) %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  select(period, Group, mean_NHS24_calls, sd_NHS24_calls, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_NHS24_calls,sd_NHS24_calls,N))
+
+processed$SMR01_mean_episodes <-
+  excel_tables$SMR01 %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_spells, sd_spells, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_spells,sd_spells,N))
+
+processed$SMR01_mean_days <-
+  excel_tables$SMR01 %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_days, sd_days, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_days,sd_days,N))
+
+processed$CUPS_mean_pathways <-
+  excel_tables$CUPS %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_cups, sd_cups, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_cups,sd_cups,N))
+
+processed$CUPS_mean_steps <-
+  excel_tables$CUPS %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_episodes, sd_episodes, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_episodes,sd_episodes,N))
+
+processed$PIS_psychotropics_mean_prescriptions <-
+  excel_tables$PIS_psychotropic_narrow %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_prescriptions, sd_prescriptions, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_prescriptions,sd_prescriptions,N))
+
+processed$PIS_psychotropics_mean_cost <-
+  excel_tables$PIS_psychotropic_narrow %>%
+  filter(users=="entire group") %>%
+  mutate(period = if_else(period=="baseline", "t1", "t2")) %>%
+  left_join(denominators) %>%
+  select(period, Group, mean_cost, sd_cost, N) %>%
+  pivot_wider(names_from = c(period), values_from=c(mean_cost,sd_cost,N))
+```
+
+## Adding estimated differences baseline-study period
+
+```{r}
+tests <-
+  map(
+    .x = processed,
+    .f = function(tbl) {
+      mean_t1 <- names(tbl)[str_detect(names(tbl),pattern="mean.*t1")]
+      mean_t2 <- names(tbl)[str_detect(names(tbl),pattern="mean.*t2")]
+      sd_t1 <- names(tbl)[str_detect(names(tbl),pattern="sd.*t1")]
+      sd_t2 <- names(tbl)[str_detect(names(tbl),pattern="sd.*t2")]
+      
+      tbl %>%
+      group_by(Group) %>%
+      summarise(
+        pooled_sd = (!!rlang::sym(sd_t1)*(N_t1-1)+!!rlang::sym(sd_t2)*(N_t2-1))/(N_t1-1+N_t1-1),
+        tidy(BSDA::tsum.test(
+          mean.x = !!rlang::sym(mean_t2),
+          s.x = !!rlang::sym(sd_t2),
+          n.x = N_t2,
+          mean.y = !!rlang::sym(mean_t1),
+          s.y = !!rlang::sym(sd_t1),
+          n.y = N_t1,
+          var.equal = FALSE
+          ## BSDA::tsum.test() performs a t-test from summary statistics, however, unlike other htest() methods it has a "parameters" value rather than "parameter", so this needs to be renamed
+        ) %>% (function(ret.val) {ret.val$parameter <- ret.val$parameters; return(ret.val)})),
+        .groups = "drop"
+      ) %>%
+       mutate(
+        difference = estimate1 - estimate2,
+        meaning = "1 = study period, 2 = baseline"
+        ) %>%
+      relocate(difference, .before=statistic)
+    }
+  )
+
+# tests$AandE_mean_episodes_before_after <-
+#   processed$AandE_mean_episodes %>%
+#   group_by(Group) %>%
+#   summarise(
+#     tidy(BSDA::tsum.test(
+#       mean.x = mean_episodes_t1,
+#       s.x = sd_episodes_t1,
+#       n.x = N_users_t1,
+#       mean.y = mean_episodes_t2,
+#       s.y = sd_episodes_t1,
+#       n.y = N_users_t2,
+#       var.equal = FALSE
+#     )),
+#     .groups = "drop"
+#   ) %>%
+#   mutate(
+#     difference = estimate2 - estimate1,
+#     meaning = "1 = baseline, 2 = study period"
+#     ) %>%
+#   relocate(difference, .before=statistic)
+# 
+# 
+# tests$AandE_mean_episodes_before_after <-
+#   processed$AandE_mean_episodes %>%
+#   group_by(Group) %>%
+#   summarise(
+#     tidy(BSDA::tsum.test(
+#       mean.x = mean_episodes_t2,
+#       s.x = sd_episodes_t1,
+#       n.x = N_users_t2,
+#       mean.y = mean_episodes_t1,
+#       s.y = sd_episodes_t1,
+#       n.y = N_users_t1,
+#       var.equal = FALSE
+#     )),
+#     .groups = "drop"
+#   ) %>%
+#   mutate(
+#     difference = estimate1 - estimate2,
+#     meaning = "1 = study period, 2 = baseline"
+#     ) %>%
+#   relocate(difference, .before=statistic)
+# 
+# # TODO: t-tests of difference-in-differences between groups
+# ggplot(
+#   data = tests$AandE_mean_episodes_before_after,
+#   aes(x = Group, y = difference)
+#   ) +
+#   geom_point(size=2) +
+#   geom_errorbar(aes(ymin=conf.low, ymax=conf.high), size=1.25) +
+#   geom_hline(yintercept = 0, linetype = "dashed") +
+#   theme_minimal() +
+#   NULL
+```
+
+## Computing ICJ-G2 & ICJ-G3 differences
+
+We can assume that the baseline-study period differences are distributed normally N(mean, sd), and use the degrees of freedom (using Welch-Straithwaite formula) as the size of the samples in computing a further difference between means, this time between the ICJ group and both of the two others.
+
+I'm using the term "change score" to denote the change between baseline and study period:
+
+```{r}
+tests_change_scores <-
+  map(
+    .x = tests,
+    .f = function(test_tbl) {
+      bind_rows(
+        ## ICJ~G2
+        test_tbl %>% filter(Group %in% c("ICJ","G2")) %>% 
+          summarise(
+          tidy(BSDA::tsum.test(
+            mean.x = difference[2],
+            s.x = pooled_sd[2],
+            n.x = parameter[2],
+            mean.y = difference[1],
+            s.y = pooled_sd[1],
+            n.y = parameter[1],
+            var.equal = FALSE
+            ## BSDA::tsum.test() performs a t-test from summary statistics, however, unlike other htest() methods it has a "parameters" value rather than "parameter", so this needs to be renamed
+          )  %>% (function(ret.val) {ret.val$parameter <- ret.val$parameters; return(ret.val)})),
+          .groups = "drop"
+        ),
+        ## ICJ~G3
+        test_tbl %>% filter(Group %in% c("ICJ","G3")) %>% 
+          summarise(
+          tidy(BSDA::tsum.test(
+            mean.x = difference[2],
+            s.x = pooled_sd[2],
+            n.x = parameter[2],
+            mean.y = difference[1],
+            s.y = pooled_sd[1],
+            n.y = parameter[1],
+            var.equal = FALSE
+            ## BSDA::tsum.test() performs a t-test from summary statistics, however, unlike other htest() methods it has a "parameters" value rather than "parameter", so this needs to be renamed
+          )  %>% (function(ret.val) {ret.val$parameter <- ret.val$parameters; return(ret.val)})),
+          .groups = "drop"
+        )
+      ) %>%
+       mutate(
+        difference = estimate1 - estimate2,
+        comparison = c("ICJ-G2","ICJ-G3"),
+        meaning = c("difference between change scores")
+        ) %>%
+      relocate(difference, .before=statistic)
+    }
+  )
+
+map_dfr(
+  tests_change_scores,
+  .f = ~.x, 
+  .id = "measure"
+) %>% filter(p.value>=.005)
+```
+
+# Tables to report
+
+```{r}
+table_descriptives_measures <-
+  processed %>%
+  map_dfr(
+    .x = .,
+    .f = function(tbl) {
+      mean_t1 <- names(tbl)[str_detect(names(tbl),pattern="mean.*t1")]
+      mean_t2 <- names(tbl)[str_detect(names(tbl),pattern="mean.*t2")]
+      sd_t1 <- names(tbl)[str_detect(names(tbl),pattern="sd.*t1")]
+      sd_t2 <- names(tbl)[str_detect(names(tbl),pattern="sd.*t2")]
+      
+      tbl %>%
+        mutate(baseline_mean_sd = print_mean_sd_inline(!!rlang::sym(mean_t1), !!rlang::sym(sd_t1), digits=2), study_mean_sd = print_mean_sd_inline(!!rlang::sym(mean_t2), !!rlang::sym(sd_t2), digits=2)) %>% select(Group,baseline_mean_sd, study_mean_sd)
+    }, 
+    .id = "Measure"
+  ) %>% pivot_wider(names_from = Group, values_from = c(baseline_mean_sd,study_mean_sd), names_glue = "{Group}_{.value}") %>%
+  left_join(nice_names_for_measures) %>%
+  mutate(Measure = nice_name) %>%
+  select(-nice_name) %>%
+  rename_all(.funs = ~rename_groups_to_nice_names(.))
+
+table_change_scores <-
+  map_dfr(
+    .x = tests,
+    .f = ~select(., Group, difference, pooled_sd, p.value),
+    .id = "Measure"
+  ) %>%
+  mutate(
+    change_from_baseline_mean_sd = print_mean_sd_inline(difference, pooled_sd, digits=2),
+    change_from_baseline_mean_sd = if_else(p.value < .05, paste0(change_from_baseline_mean_sd, "*"), as.character(change_from_baseline_mean_sd))
+    ) %>%
+  select(Measure, Group, change_from_baseline_mean_sd) %>%
+  pivot_wider(names_from=Group, values_from = change_from_baseline_mean_sd) %>%
+  left_join(nice_names_for_measures) %>%
+  mutate(Measure = nice_name) %>%
+  select(-nice_name) %>%
+  rename_all(.funs = ~rename_groups_to_nice_names(.))
+```
+
+
+## Bonferroni correction check
+
+In the proposal we set the alpha level to .0042 to account for 12 tests using the same data - this isn't entirely correct, because the datasets are different for each of the 6 domains, bu we can still check how many of the means are significantly different at that level:
+
+```{r}
+tests %>% map_dfr(., .f=~., .id="Measure") %>% filter(p.value >= .0042)
+
+tests_change_scores %>% map_dfr(., .f=~., .id="Measure") %>% filter(p.value >= .0042)
+```
+
+This only affects the prescriptions data, where it invalidates the finding that ICJ prescription costs increased significantly, and that ICJ had a greater prescription number increase than ROS. 
+
+
+# Saving tables produced
+
+```{r}
+tables_to_save <- list(
+  "Descriptives cancer stages" = table_cancer_stages_decriptives,
+  "Descr. combined cancer stages" = table_cancer_stages_combined %>%
+  mutate(Group = rename_groups_to_nice_names(Group)) %>%
+  arrange(factor(Group,levels=c("ICJ","Glasgow","ROS"))),
+  "Descriptives measures" = table_descriptives_measures,
+  "Descriptives change scores" = table_change_scores
+)
+write.xlsx(x = tables_to_save, file = file.path(dir_results, "table_descriptives.xlsx"))
+```
+
+
+# Methods
+
+## Cohort
+
+Two comparison cohorts were established: one was used to compare the ICJ cohort to similar individuals in the same city (Glasgow) prior to the establishment of the ICJ service, and another to compare them to individuals during the same period in the rest of Scotland (ROS). The rationale was that the ICJ service was not available prior to 2014 in Glasgow or in ROS during ICJ's functioning and so the effect of the ICJ service could be estimated as the difference between the ICJ group and the other two cohorts. Data extraction was limited to the years 2011-2018. Of the approximately N=4,200 users of ICJ Glasgow in the period 2014-2018, matches were found for N=`r format(denominators$N[denominators$Group=="ICJ"], big.mark = ",")` individuals, of which 87% had a match in both control groups. N=`r format(denominators$N[denominators$Group=="G2"], big.mark = ",")` controls were matched with SMR06 records in the pre-ICJ period 2012-2013, residing in Glasgow, and N=`r format(denominators$N[denominators$Group=="G3"], big.mark = ",")` controls were matched with SMR06 records in the period 2013-2017, residing in ROS. In addition to the time periods and geographical areas in the SMR06 record, controls were matched on age, gender, and cancer type grouped into Breast, Bowel, Lung, Prostate, or Other (see Appendix for details of groupings).
+
+## Baseline and study periods
+
+To compare the effects of the availability of the ICJ service (starting in 2014), we defined a “baseline” period of service usage, which was 12 months prior to every individual's cancer registration date in SMR06. This was compared to the service usage during a period concurrent with ICJ usage, which was defined as the 12 months starting from the first ICJ assessment for ICJ users, or as the 12 months starting from the equivalent date relative to cancer registration in SMR06 for controls (for example, if an ICJ user had their first ICJ assessment 3 months after cancer registration, their matched control’s ICJ-concurrent period started 3 months after their cancer registration.
+
+## Data linkage
+
+The eDRIS team provided the data matching and linkage. In addition to the SMR06 (Cancer registrations) record, records from the following datasets were also linked:
+•	SMR01 (Scottish Morbidity Record; physical health admissions for in-patient and day cases)
+•	PIS (Prescribing Information System; Number & cost of presctiptions)
+•	A&E admissions
+•	NHS24 calls
+•	CUPS (Unscheduled care pathways usage)
+
+Linked data were available for the period 2011 to 2018. For the 7% of the pre-ICJ Glasgow control group who had cancer registrations in 2011, there was a risk of underestimating service usage during the baseline period as part of the baseline period fell outside the available data limits.
+
+## Data analyis
+
+We used TNM staging, FIGO prior to and after surgery, and colorectal (Duke’s) staging variables from cancer registration data. TNM scores were computed for lung, prostate, breast, and bowel cancers using algorithms (see Appendix). Colorectal (Duke’s) stages A,B,C,D were considered equivalent to stages 1,2,3,4, respectively. FIGO stages were simplified to their numeric value (e.g. stage 2b was simplified to 2). Where an individual had multiple cancer registration entries for the same cacncer type, the highest stage was used.
+
+Service usage was defined in terms of:
+
+* NHS24 calls made
+* A&E attendances
+* Time spent in A&E as a proxy of severity
+* Spells in hospital (inpatient or day cases, SMR01)
+* Time spent in hospital as a proxy of severity
+* Number of care pathway entries
+* Complexity of care pathway entries as a proxy of severity
+* Number of prescriptions for psychotropic drugs
+* Cost of prescriptions for psychotropic drugs as a proxy of severity
+
+All outcomes were averaged over the entire sample to compare the overall service usage of the groups.
+
+Descriptive statistics were computed for the sample characteristics and service usage measures: SMR01 admissions, A&E admissions, NHS24 calls, unscheduled care pathway usage, psychotropic medicine prescriptions.
+Differences between means ("change scores") of service usage between baseline and ICJ-concurrent periods were computed for the groups and compared across groups using two-sided Welch's t-tests.
+
+Days in hospital were computed as the difference between discharge and admission dates plus one (so that discharges on the same day are treated as one day). The number of care pathways was the number of entries representing continuous spells in the Unscheduled care; the number of steps was computed as the total of the individual services used as part of all care pathways for an individual.
+
+Psychotropic drugs were defined as those belonging to chapters 4.1 to 4.4 and 4.11 in the British National Formulary (BNF). 
+
+# Results
+
+Table 1: patient characteristics
+
+## Cancer stage
+
+Figure 1: Distribution of cancer stages: frequency of stage by cancer & group. Missing values not plotted. Note that some individuals had more than one cancer type recorded, and more than one record of the same type: the highest stage was used for each individual per type.
+
+Table 2: Descriptive summary of cancer stage by cancer type and proportion of missing values. * indicates that the mean was different from the ICJ group at p<.025
+
+Table 3: Descriptive summary of cancer stage collapsed over groups.
+
+A descriptive summary of cancer stages by type can be found in Table 2, with a summary of cancer stages collapsed over cancer types in Table 3. There was a large number of missing values when computing cancer stage, particularly for Other (82-87%) and Prostate (39-61%) cancers. Despite this, cancer stage was higher in the ICJ group than both the Glasgow (`r signif(tests_cancer_stages_combined$difference[tests_cancer_stages_combined$comparison=="ICJ-G2 stages combined"],digits=2)`, p=`r tests_cancer_stages_combined$p.value[tests_cancer_stages_combined$comparison=="ICJ-G2 stages combined"]`) and ROS groups (`r signif(tests_cancer_stages_combined$difference[tests_cancer_stages_combined$comparison=="ICJ-G3 stages combined"],digits=2)`, p=`r tests_cancer_stages_combined$p.value[tests_cancer_stages_combined$comparison=="ICJ-G3 stages combined"]`), meaning that the cancers in the ICJ group were more severe. The overall difference was due to higher scores on Prostate, Bowel & Other cancers in the ICJ group, whereas Breast & Lung cancer stages weren't significantly different.
+
+## Service usage
+
+Table 4: Descriptive summary of service usage at baseline and study periods.
+
+Table 5: Descriptive summary of service usage change scores between baseline and study periods. * indicates a significant difference between baseline and study period service usage at p<.05
+
+
+Table 4 contains descriptive summaries of service usage during the baseline and study periods, while Table 5 shows the service usage change scores between baseline and study periods.
 
 ## NHS24
 
-```{r}
-excel_tables$NHS24 %>% filter(users == "entire group") %>%
-  mutate(proportion_users = parse_number(proportion_users) / 100)
+In the baseline period, `r excel_tables$NHS24$proportion_users[excel_tables$NHS24$Group=="ICJ" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"]` of ICJ users made one or more NHS24 calls, compared to `r excel_tables$NHS24$proportion_users[excel_tables$NHS24$Group=="G2" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"]` in Glasgow, and `r excel_tables$NHS24$proportion_users[excel_tables$NHS24$Group=="G3" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"]` in ROS. The increase in users for the ICJ group was largest during the study period to `r excel_tables$NHS24$proportion_users[excel_tables$NHS24$Group=="ICJ" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"]`, followed by Glasgow at `r excel_tables$NHS24$proportion_users[excel_tables$NHS24$Group=="G2" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"]` and ROS at `r excel_tables$NHS24$proportion_users[excel_tables$NHS24$Group=="G3" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"]`.
+
+NHS24 calls increased from baseline to the study period more in the ICJ than in the Glasgow group (`r round(tests_change_scores$NHS24_mean_calls$difference[tests_change_scores$NHS24_mean_calls$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$NHS24_mean_calls$p.value[tests_change_scores$NHS24_mean_calls$comparison=="ICJ-G2"],2)`). Note that there was a very small number of high frequency callers in the Glasgow group at baseline and we observered no change between baseline and the study period. The difference in increased calls between the ICJ and ROS groups was not significant (`r signif(tests_change_scores$NHS24_mean_calls$difference[tests_change_scores$NHS24_mean_calls$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$NHS24_mean_calls$p.value[tests_change_scores$NHS24_mean_calls$comparison=="ICJ-G3"],2)`)).
+
+<!-- The Mean (SD) of the number of calls (averaged over entire group, including non-users) made in the baseline period was `r print_mean_sd_inline(excel_tables$NHS24$mean_NHS24_calls[excel_tables$NHS24$Group=="ICJ" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"], excel_tables$NHS24$sd_NHS24_calls[excel_tables$NHS24$Group=="ICJ" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"])` in the ICJ group, compared to `r print_mean_sd_inline(excel_tables$NHS24$mean_NHS24_calls[excel_tables$NHS24$Group=="G2" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"], excel_tables$NHS24$sd_NHS24_calls[excel_tables$NHS24$Group=="G2" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"])` in Glasgow, and `r print_mean_sd_inline(excel_tables$NHS24$mean_NHS24_calls[excel_tables$NHS24$Group=="G3" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"], excel_tables$NHS24$sd_NHS24_calls[excel_tables$NHS24$Group=="G3" & excel_tables$NHS24$period=="baseline" & excel_tables$NHS24$users=="entire group"])` in ROS.  The high SD in the Glasgow group was the result of a very small number of high-frequency callers. -->
+
+<!-- The Mean (SD) of the number of calls made in the study period was `r print_mean_sd_inline(excel_tables$NHS24$mean_NHS24_calls[excel_tables$NHS24$Group=="ICJ" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"], excel_tables$NHS24$sd_NHS24_calls[excel_tables$NHS24$Group=="ICJ" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"])` in the ICJ group, compared to `r print_mean_sd_inline(excel_tables$NHS24$mean_NHS24_calls[excel_tables$NHS24$Group=="G2" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"], excel_tables$NHS24$sd_NHS24_calls[excel_tables$NHS24$Group=="G2" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"])` in Glasgow, and `r print_mean_sd_inline(excel_tables$NHS24$mean_NHS24_calls[excel_tables$NHS24$Group=="G3" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"], excel_tables$NHS24$sd_NHS24_calls[excel_tables$NHS24$Group=="G3" & excel_tables$NHS24$period=="usage" & excel_tables$NHS24$users=="entire group"])` in ROS. -->
 
 
-```
+## A & E
 
-# Time period
+In the baseline period, `r excel_tables$AandE$proportion_users[excel_tables$AandE$Group=="ICJ" & excel_tables$AandE$period=="baseline" & excel_tables$AandE$users=="entire group"]` of ICJ users attended A&E one or more times, compared to `r excel_tables$AandE$proportion_users[excel_tables$AandE$Group=="G2" & excel_tables$AandE$period=="baseline" & excel_tables$AandE$users=="entire group"]` in Glasgow, and `r excel_tables$AandE$proportion_users[excel_tables$AandE$Group=="G3" & excel_tables$AandE$period=="baseline" & excel_tables$AandE$users=="entire group"]` in ROS. In the study period, the proportion of A&E attenders increased to `r excel_tables$AandE$proportion_users[excel_tables$AandE$Group=="ICJ" & excel_tables$AandE$period=="usage" & excel_tables$AandE$users=="entire group"]` in the ICJ group, compared to `r excel_tables$AandE$proportion_users[excel_tables$AandE$Group=="G2" & excel_tables$AandE$period=="usage" & excel_tables$AandE$users=="entire group"]` in Glasgow and `r excel_tables$AandE$proportion_users[excel_tables$AandE$Group=="G3" & excel_tables$AandE$period=="usage" & excel_tables$AandE$users=="entire group"]` in ROS.
 
-```{r}
-table_time_periods <- 
-  bind_rows(
-    bind_rows(group2,group3) %>% select(id, AssessmentStartDate, INCIDENCE_DATE) %>% mutate(group = "ICJ") %>% distinct,
-    group2 %>% select(INCIDENCE_DATE=INCIDENCE_DATE_c, group),
-    group3 %>% select(INCIDENCE_DATE=INCIDENCE_DATE_c, group)
-  ) %>%
-    group_by(group) %>%
-    summarise(
-      "ICJ use" = paste0(year(min(AssessmentStartDate)),"-",year(max(AssessmentStartDate))),
-      "Cancer incidence" = paste0(year(min(INCIDENCE_DATE)),"-",year(max(INCIDENCE_DATE)))
-    )
 
-table_time_periods %>% kable(caption = "Time periods of data for cases & controls")
-```
+A&E attendances increased from baseline to the study period more in the ICJ than both the Glasgow group (`r round(tests_change_scores$AandE_mean_episodes$difference[tests_change_scores$AandE_mean_episodes$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$AandE_mean_episodes$p.value[tests_change_scores$AandE_mean_episodes$comparison=="ICJ-G2"],2)`), and the ROS group (`r signif(tests_change_scores$AandE_mean_episodes$difference[tests_change_scores$AandE_mean_episodes$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$AandE_mean_episodes$p.value[tests_change_scores$AandE_mean_episodes$comparison=="ICJ-G3"],2)`)).
 
+Hours spent in A&E also increased from baseline to the study period more in the ICJ group than both Glasgow (`r round(tests_change_scores$AandE_mean_hours$difference[tests_change_scores$AandE_mean_hours$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$AandE_mean_hours$p.value[tests_change_scores$AandE_mean_hours$comparison=="ICJ-G2"],2)`), and ROS (`r round(tests_change_scores$AandE_mean_hours$difference[tests_change_scores$AandE_mean_hours$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$AandE_mean_hours$p.value[tests_change_scores$AandE_mean_hours$comparison=="ICJ-G3"],2)`)
+
+
+## Hospital attendance
+
+
+In the baseline period, `r excel_tables$SMR01$proportion_users[excel_tables$SMR01$Group=="ICJ" & excel_tables$SMR01$period=="baseline" & excel_tables$SMR01$users=="entire group"]` of ICJ users had one or more hospital admissions, compared to `r excel_tables$SMR01$proportion_users[excel_tables$SMR01$Group=="G2" & excel_tables$SMR01$period=="baseline" & excel_tables$SMR01$users=="entire group"]` in Glasgow, and `r excel_tables$SMR01$proportion_users[excel_tables$SMR01$Group=="G3" & excel_tables$SMR01$period=="baseline" & excel_tables$SMR01$users=="entire group"]` in ROS. In the study period, `r excel_tables$SMR01$proportion_users[excel_tables$SMR01$Group=="ICJ" & excel_tables$SMR01$period=="usage" & excel_tables$SMR01$users=="entire group"]` of ICJ users had hospital admissions, followed by Glasgow at `r excel_tables$SMR01$proportion_users[excel_tables$SMR01$Group=="G2" & excel_tables$SMR01$period=="usage" & excel_tables$SMR01$users=="entire group"]` and ROS at `r excel_tables$SMR01$proportion_users[excel_tables$SMR01$Group=="G3" & excel_tables$SMR01$period=="usage" & excel_tables$SMR01$users=="entire group"]`.
+
+
+
+Hospital spells increased from baseline to the study period more in the ICJ than both in the Glasgow group (`r round(tests_change_scores$SMR01_mean_episodes$difference[tests_change_scores$SMR01_mean_episodes$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$SMR01_mean_episodes$p.value[tests_change_scores$SMR01_mean_episodes$comparison=="ICJ-G2"],2)`), and in the ROS group (`r signif(tests_change_scores$SMR01_mean_episodes$difference[tests_change_scores$SMR01_mean_episodes$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$SMR01_mean_episodes$p.value[tests_change_scores$SMR01_mean_episodes$comparison=="ICJ-G3"],2)`)).
+
+
+Days in hospital also increased from baseline to the study period more in the ICJ than both in the Glasgow group (`r round(tests_change_scores$SMR01_mean_days$difference[tests_change_scores$SMR01_mean_days$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$SMR01_mean_days$p.value[tests_change_scores$SMR01_mean_days$comparison=="ICJ-G2"],2)`), and the ROS group was not significant (`r signif(tests_change_scores$SMR01_mean_days$difference[tests_change_scores$SMR01_mean_days$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$SMR01_mean_days$p.value[tests_change_scores$SMR01_mean_days$comparison=="ICJ-G3"],2)`)).
+
+
+## care pathways
+
+
+In the baseline period, `r excel_tables$CUPS$proportion_users[excel_tables$CUPS$Group=="ICJ" & excel_tables$CUPS$period=="baseline" & excel_tables$CUPS$users=="entire group"]` of ICJ users had one or more care pathways recorded, compared to `r excel_tables$CUPS$proportion_users[excel_tables$CUPS$Group=="G2" & excel_tables$CUPS$period=="baseline" & excel_tables$CUPS$users=="entire group"]` in Glasgow, and `r excel_tables$CUPS$proportion_users[excel_tables$CUPS$Group=="G3" & excel_tables$CUPS$period=="baseline" & excel_tables$CUPS$users=="entire group"]` in ROS. In the study period, `r excel_tables$CUPS$proportion_users[excel_tables$CUPS$Group=="ICJ" & excel_tables$CUPS$period=="usage" & excel_tables$CUPS$users=="entire group"]` of ICJ users had one or more care pathways recorded, followed by Glasgow at `r excel_tables$CUPS$proportion_users[excel_tables$CUPS$Group=="G2" & excel_tables$CUPS$period=="usage" & excel_tables$CUPS$users=="entire group"]` and ROS at `r excel_tables$CUPS$proportion_users[excel_tables$CUPS$Group=="G3" & excel_tables$CUPS$period=="usage" & excel_tables$CUPS$users=="entire group"]`.
+
+
+The number of care pathways increased from baseline to the study period more in the ICJ than both in the Glasgow group (`r round(tests_change_scores$CUPS_mean_pathways$difference[tests_change_scores$CUPS_mean_pathways$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$CUPS_mean_pathways$p.value[tests_change_scores$CUPS_mean_pathways$comparison=="ICJ-G2"],2)`), and in the ROS group (`r signif(tests_change_scores$CUPS_mean_pathways$difference[tests_change_scores$CUPS_mean_pathways$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$CUPS_mean_pathways$p.value[tests_change_scores$CUPS_mean_pathways$comparison=="ICJ-G3"],2)`)).
+
+The complexity of care pathways (number of steps) increased from baseline to the study period more in the ICJ than both in the Glasgow group (`r round(tests_change_scores$CUPS_mean_steps$difference[tests_change_scores$CUPS_mean_steps$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$CUPS_mean_steps$p.value[tests_change_scores$CUPS_mean_steps$comparison=="ICJ-G2"],2)`), and in the ROS group (`r signif(tests_change_scores$CUPS_mean_steps$difference[tests_change_scores$CUPS_mean_steps$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$CUPS_mean_steps$p.value[tests_change_scores$CUPS_mean_steps$comparison=="ICJ-G3"],2)`)).
+
+
+## Prescriptions for psychotropic drugs
+
+
+In the baseline period, `r excel_tables$PIS$proportion_users[excel_tables$PIS$Group=="ICJ" & excel_tables$PIS$period=="baseline" & excel_tables$PIS$users=="entire group"]` of ICJ users had one or more prescriptions for psychotropic drugs, compared to `r excel_tables$PIS$proportion_users[excel_tables$PIS$Group=="G2" & excel_tables$PIS$period=="baseline" & excel_tables$PIS$users=="entire group"]` in Glasgow, and `r excel_tables$PIS$proportion_users[excel_tables$PIS$Group=="G3" & excel_tables$PIS$period=="baseline" & excel_tables$PIS$users=="entire group"]` in ROS. In the study period, `r excel_tables$PIS$proportion_users[excel_tables$PIS$Group=="ICJ" & excel_tables$PIS$period=="usage" & excel_tables$PIS$users=="entire group"]` of ICJ users had one or more prescriptions for psychotropic drugs, followed by Glasgow at `r excel_tables$PIS$proportion_users[excel_tables$PIS$Group=="G2" & excel_tables$PIS$period=="usage" & excel_tables$PIS$users=="entire group"]` and ROS at `r excel_tables$PIS$proportion_users[excel_tables$PIS$Group=="G3" & excel_tables$PIS$period=="usage" & excel_tables$PIS$users=="entire group"]`.
+
+
+
+The number of psychotropic drug prescriptions increased from baseline to the study period in both ICJ and in the Glasgow group, but the increase was not significantly different. (`r round(tests_change_scores$PIS_psychotropics_mean_prescriptions$difference[tests_change_scores$PIS_psychotropics_mean_prescriptions$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$PIS_psychotropics_mean_prescriptions$p.value[tests_change_scores$PIS_psychotropics_mean_prescriptions$comparison=="ICJ-G2"],2)`); there was a significant difference in the increase in prescriptions between the ICJ and ROS groups (`r signif(tests_change_scores$PIS_psychotropics_mean_prescriptions$difference[tests_change_scores$PIS_psychotropics_mean_prescriptions$comparison=="ICJ-G3"],2)`, p=`r signif(tests_change_scores$PIS_psychotropics_mean_prescriptions$p.value[tests_change_scores$PIS_psychotropics_mean_prescriptions$comparison=="ICJ-G3"],2)`)).
+
+The cost of psychotropic prescriptions only increased between baseline and the study period in the ICJ group but not the Glasgow or ROS groups; the differences in increased cost weren't significant between ICJ and Glasgow (`r signif(tests_change_scores$PIS_psychotropics_mean_cost$difference[tests_change_scores$PIS_psychotropics_mean_cost$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$PIS_psychotropics_mean_cost$p.value[tests_change_scores$PIS_psychotropics_mean_cost$comparison=="ICJ-G2"],2)`) nor ICJ and ROS (`r signif(tests_change_scores$PIS_psychotropics_mean_cost$difference[tests_change_scores$PIS_psychotropics_mean_cost$comparison=="ICJ-G2"],2)`, p=`r signif(tests_change_scores$PIS_psychotropics_mean_cost$p.value[tests_change_scores$PIS_psychotropics_mean_cost$comparison=="ICJ-G2"],2)`). The cost of psychotropic drug prescriptions was somewhat lower and less variable in the ICJ group at baseline.
+
+# Discussion
+
+We hypothesised that ICJ users would require the use of fewer health services, having more of their needs met by ICJ and the resulting referrals. However, we observed a larger increase in NHS24 calls in the ICJ group than in ROS, more and longer A&E attendances in ICJ than in Glasgow and ROS, more and longer hospital admissions in ICJ than Glasgow and ROS, more care pathways involving more steps in ICJ than Glasgow or ROS, more psychotropic drug prescriptions in ICJ than in ROS, and a significant increase in psychotropic prescription costs in ICJ, which was not observed in Glasgow or ROS. Although the results were not consistent with the hypothesis that ICJ service reduced health service usage, we also found that the severity of cancer was higher in the ICJ group, prompting the explanation that the ICJ cohort is more severely ill than the Glasgow & ROS cohorts, with correspondingly higher service usage.
+
+## Weaknesses
+
+We did not control for comorbidities which may have had an effect on service usage in addition to the type & severity of cancer. Self-reported comorbidity data are collected by ICJ but the equivalent could not be obtained for the comparison cohorts.
+
+The 12 month periods were chosen arbitrarily to define baseline and ICJ service-concurrent service usage periods. These were defined on an individual level, which means the results may have been confounded by seasonal and temporal effects, though we expect that these effects were small in the relatively short period 2011-2018. Although the ICJ service endeavours to assess users as soon as possible after their cancer diagnosis, the actual timing varies, which may have also confounded the results.
