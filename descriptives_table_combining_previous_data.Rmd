@@ -36,10 +36,13 @@ print_mean_ci_inline <- function(mean, ci_lo, ci_hi, digits=1) {
   return(glue::glue("{format(round(mean,digits=digits),nsmall=digits,trim=TRUE)} [{format(round(ci_lo,digits=digits),nsmall=digits,trim=TRUE)}-{format(round(ci_hi,digits=digits),nsmall=digits,trim=TRUE)}]"))
 }
 
+group_levels_crude <- c("ICJ", "G2", "G3")
+group_levels_clean <- c("ICJ", "Glasgow, pre-ICJ", "ROS")
+
 rename_groups_to_nice_names <- function(some_string) {
   some_string %>%
-  str_replace(string = ., pattern = "g2|G2", replacement = "Glasgow, pre-ICJ") %>%
-  str_replace(string = ., pattern = "g3|G3", replacement = "ROS")
+  str_replace(string = ., pattern = "g2|G2", replacement = group_levels_clean[2]) %>%
+  str_replace(string = ., pattern = "g3|G3", replacement = group_levels_clean[3])
 }
 
 dir_results <- "./results"
@@ -118,8 +121,10 @@ table_cancer_stages_summary <-
   as_tibble() %>% 
   mutate(
     N_total = N,  # compute non-missing N
-    N = N_total - (round(parse_number(prop_missing)/100 * N_total))
+    N = N_total - (round(parse_number(prop_missing)/100 * N_total)),
+    Group = factor(Group, levels = group_levels_crude)
     )
+
 data_for_cancer_stage_plot <-
   table_cancer_stages_counts %>%
   pivot_longer(cols=c(G2,G3,ICJ), names_to="Group", values_to="stage") %>%
@@ -129,12 +134,12 @@ data_for_cancer_stage_plot <-
     proportion = parse_number(stage, na = c("","NA","<=10")) / 100,
     was_suppressed = is.na(proportion),  # flag where the small N
     proportion = if_else(was_suppressed, proportion_10, proportion),  # infer small proportion where data missing
-    Group = rename_groups_to_nice_names(Group) %>% factor(., levels=c("ICJ","Glasgow","ROS"))
+    Group = rename_groups_to_nice_names(Group) %>% factor(., levels=group_levels_clean)
     )
 
 missing_data_cancer_stages_summary <-
   table_cancer_stages_summary %>%
-  mutate(Group = rename_groups_to_nice_names(Group) %>% factor(., levels=c("ICJ","Glasgow","ROS")))
+  mutate(Group = rename_groups_to_nice_names(Group) %>% factor(., levels=group_levels_clean))
 
 plot_cancer_stage_data_reconstructed <-
   ggplot(data = data_for_cancer_stage_plot, aes(x = stage_numeric_worst, y = proportion, fill = was_suppressed)) +
@@ -205,7 +210,10 @@ tests_cancer_stages <-
     )
   }) %>%
   relocate(meaning, .after=cancer_type_grouped) %>%
-  mutate(Group = str_extract(string = meaning, pattern="G\\d"))
+  mutate(
+    Group = str_extract(string = meaning, pattern="G\\d"),
+    Group = factor(Group, levels = group_levels_crude)
+    )
 
 table_cancer_stages_combined <-
   table_cancer_stages_summary %>%
@@ -214,6 +222,8 @@ table_cancer_stages_combined <-
     mean = weighted.mean(x = Mean_stage, w = N),
     N = sum(N),
     sd = sqrt(sum(SD_stage^2)),
+    ci_95_low = mean + qt(0.025, df = N-1) * sd/sqrt(N),
+    ci_95_high = mean + qt(0.975, df = N-1) * sd/sqrt(N),
     .groups = "drop"
     )
 
@@ -248,15 +258,32 @@ tests_cancer_stages_combined <-
     relocate(difference, .before=statistic)
   
 
-table_cancer_stages_decriptives <-
+table_cancer_stages_decriptives_with_sd <-
   table_cancer_stages_summary %>%
   left_join(tests_cancer_stages %>% select(Group, cancer_type_grouped, p.value)) %>%
   mutate(
     mean_sd = print_mean_sd_inline(Mean_stage, SD_stage,digits=2),
     mean_sd = if_else(!is.na(p.value) & p.value < 0.025, paste0(mean_sd,"*"), as.character(mean_sd))  # add asterisk to significantly different means in G2 or G3 from ICJ at .025 (for two tests)
     ) %>%
-  select(cancer_type_grouped, Group, prop_missing, mean_sd) %>%
-  pivot_wider(names_from = Group, values_from = c(mean_sd, prop_missing)) %>%
+  select(cancer_type_grouped, Group, mean_sd, prop_missing, N) %>%
+  arrange(cancer_type_grouped, Group) %>%
+  pivot_wider(names_from = Group, values_from = c(N, prop_missing, mean_sd), names_vary = "slowest") %>%
+  rename_all(~rename_groups_to_nice_names(.))
+
+table_cancer_stages_decriptives_with_ci <-
+  table_cancer_stages_summary %>%
+  mutate(
+    ci_95_lo = Mean_stage + qt(0.025, df = N-1) * SD_stage/sqrt(N),
+    ci_95_hi = Mean_stage + qt(0.975, df = N-1) * SD_stage/sqrt(N),
+      ) %>%
+  left_join(tests_cancer_stages %>% select(Group, cancer_type_grouped, p.value)) %>%
+  mutate(
+    mean_ci = print_mean_ci_inline(mean = Mean_stage, ci_lo = ci_95_lo, ci_hi = ci_95_hi ,digits=2),
+    mean_ci = if_else(!is.na(p.value) & p.value < 0.025, paste0(mean_ci,"*"), as.character(mean_ci))  # add asterisk to significantly different means in G2 or G3 from ICJ at .025 (for two tests)
+    ) %>%
+  select(cancer_type_grouped, Group, mean_ci, prop_missing, N) %>%
+  arrange(cancer_type_grouped, Group) %>%
+  pivot_wider(names_from = Group, values_from = c(N, prop_missing, mean_ci), names_vary = "slowest") %>%
   rename_all(~rename_groups_to_nice_names(.))
 ```
 
@@ -549,7 +576,7 @@ table_descriptives_measures_with_ci <-
   select(-nice_name) %>%
   rename_all(.funs = ~rename_groups_to_nice_names(.))
 
-table_change_scores <-
+table_change_scores_with_sd <-
   map_dfr(
     .x = tests,
     .f = ~select(., Group, difference, pooled_sd, p.value),
@@ -561,6 +588,24 @@ table_change_scores <-
     ) %>%
   select(Measure, Group, change_from_baseline_mean_sd) %>%
   pivot_wider(names_from=Group, values_from = change_from_baseline_mean_sd) %>%
+  left_join(nice_names_for_measures) %>%
+  mutate(Measure = nice_name) %>%
+  select(-nice_name) %>%
+  rename_all(.funs = ~rename_groups_to_nice_names(.))
+
+
+table_change_scores_with_ci <-
+  map_dfr(
+    .x = tests,
+    .f = ~select(., Group, difference, pooled_sd, p.value, conf.low, conf.high),
+    .id = "Measure"
+  ) %>%
+  mutate(
+    change_from_baseline_mean_ci = print_mean_ci_inline(difference, conf.low, conf.high, digits=2),
+    change_from_baseline_mean_ci = if_else(p.value < .05, paste0(change_from_baseline_mean_ci, "*"), as.character(change_from_baseline_mean_ci))
+    ) %>%
+  select(Measure, Group, change_from_baseline_mean_ci) %>%
+  pivot_wider(names_from=Group, values_from = change_from_baseline_mean_ci) %>%
   left_join(nice_names_for_measures) %>%
   mutate(Measure = nice_name) %>%
   select(-nice_name) %>%
@@ -651,7 +696,7 @@ table_descriptives_for_supplementary_materials <-
   relocate(proportion_users, .after = N) %>%
   mutate(
     Group = rename_groups_to_nice_names(Group),
-    Group = factor(Group, levels = c("ICJ","Glasgow, pre-ICJ","ROS")),
+    Group = factor(Group, levels = group_levels_clean),
     Period = factor(Period),
     Variable = factor(Variable, levels = unique(Variable))
     ) %>%
@@ -659,18 +704,19 @@ table_descriptives_for_supplementary_materials <-
 ```
 
 
-
 # Saving tables produced
 
 ```{r}
 tables_to_save <- list(
-  "Descriptives cancer stages" = table_cancer_stages_decriptives,
+  "Descriptives cancer stages (SD)" = table_cancer_stages_decriptives_with_sd,
+  "Descriptives cancer stages (CI)" = table_cancer_stages_decriptives_with_ci,
   "Descr. combined cancer stages" = table_cancer_stages_combined %>%
   mutate(Group = rename_groups_to_nice_names(Group)) %>%
-  arrange(factor(Group,levels=c("ICJ","Glasgow","ROS"))),
+  arrange(factor(Group,levels=group_levels_clean)),
   "Descriptives measures (SD)" = table_descriptives_measures_with_sd,
   "Descriptives measures (CI)" = table_descriptives_measures_with_ci,
-  "Descriptives change scores" = table_change_scores
+  "Descriptives change scores (SD)" = table_change_scores_with_sd,
+  "Descriptives change scores (CI)" = table_change_scores_with_ci
 )
 write.xlsx(x = tables_to_save, file = file.path(dir_results, "table_descriptives.xlsx"))
 
