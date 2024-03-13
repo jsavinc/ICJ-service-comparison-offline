@@ -229,6 +229,7 @@ table_cancer_stages_combined <-
 
 tests_cancer_stages_combined <-
   table_cancer_stages_combined %>%
+  select(-c(ci_95_high, ci_95_low)) %>%  # need to do that, otherwise there's CI values that differ between members of the two comparisons
   (function(tbl) {
     list(
       tbl %>% filter(Group %in% c("G2","ICJ")) %>%
@@ -610,6 +611,34 @@ table_change_scores_with_ci <-
   mutate(Measure = nice_name) %>%
   select(-nice_name) %>%
   rename_all(.funs = ~rename_groups_to_nice_names(.))
+
+
+## additional table, expressing the mean change as multiples of the pooled sd/pooled se of mean
+table_change_scores_as_multiples_of_sd_se <-
+  map_dfr(
+    .x = tests,
+    .f = ~select(., Group, difference, pooled_sd, p.value),
+    .id = "Measure"
+  ) %>%
+  left_join(denominators, by = "Group") %>%
+  mutate(
+    pooled_se = pooled_sd / sqrt(N),
+    difference_div_by_sd = difference / pooled_sd,
+    difference_div_by_se = difference / pooled_se
+    ) %>%
+  select(
+    Measure,
+    Group,
+    change_from_baseline_mean = difference,
+    change_from_baseline_sd = pooled_sd,
+    change_from_baseline_se = pooled_se,
+    mean_divided_by_sd = difference_div_by_sd,
+    mean_divided_by_se = difference_div_by_se
+  ) %>% 
+  left_join(nice_names_for_measures) %>%
+  mutate(Measure = nice_name) %>%
+  select(-nice_name) %>%
+  rename_all(.funs = ~rename_groups_to_nice_names(.))
 ```
 
 
@@ -716,8 +745,10 @@ tables_to_save <- list(
   "Descriptives measures (SD)" = table_descriptives_measures_with_sd,
   "Descriptives measures (CI)" = table_descriptives_measures_with_ci,
   "Descriptives change scores (SD)" = table_change_scores_with_sd,
-  "Descriptives change scores (CI)" = table_change_scores_with_ci
+  "Descriptives change scores (CI)" = table_change_scores_with_ci,
+  "Change scores divided by SD,SE" = table_change_scores_as_multiples_of_sd_se
 )
+
 write.xlsx(x = tables_to_save, file = file.path(dir_results, "table_descriptives.xlsx"))
 
 write_csv(x = table_descriptives_for_supplementary_materials, file = file.path(dir_results, "table_descriptives_for_supplementary_materials.csv"))
